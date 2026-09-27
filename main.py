@@ -28,14 +28,13 @@ def get_previous_status(monitor_id):
         query = """
             SELECT is_up FROM ping_logs 
             WHERE monitor_id = %s 
-            ORDER BY pinged_at DESC 
+            ORDER BY id DESC 
             LIMIT 1;
         """
         cur.execute(query, (monitor_id,))
         result = cur.fetchone()
     conn.close()
     return result['is_up'] if result else None
-
 async def send_discord_alert(client, monitor_name, url, status_code, error_message, alert_type="DOWN"):
     """Sends formatted alert messages to Discord for both DOWN and RECOVERED states."""
     if not DISCORD_WEBHOOK_URL:
