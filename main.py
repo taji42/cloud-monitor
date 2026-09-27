@@ -21,22 +21,50 @@ def fetch_active_monitors():
     conn.close()
     return monitors
 
-async def send_discord_alert(client, monitor_name, url, status_code, error_message):
-    """Sends a formatted alert message to Discord if a target is DOWN."""
+def get_previous_status(monitor_id):
+    """Fetches the most recent 'is_up' status for a specific monitor from Supabase."""
+    conn = get_db_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        query = """
+            SELECT is_up FROM ping_logs 
+            WHERE monitor_id = %s 
+            ORDER BY pinged_at DESC 
+            LIMIT 1;
+        """
+        cur.execute(query, (monitor_id,))
+        result = cur.fetchone()
+    conn.close()
+    return result['is_up'] if result else None
+
+async def send_discord_alert(client, monitor_name, url, status_code, error_message, alert_type="DOWN"):
+    """Sends formatted alert messages to Discord for both DOWN and RECOVERED states."""
     if not DISCORD_WEBHOOK_URL:
-        print("[ALERT WARNING] DISCORD_WEBHOOK_URL not found in environment.")
+        print("[ALERT WARNING] DISCORD_WEBHOOK_URL not configured.")
         return
+
+    if alert_type == "DOWN":
+        title = f"⚠️ MONITOR ALERT: {monitor_name} IS DOWN"
+        color = 15158332  # Red
+        fields = [
+            {"name": "URL", "value": url, "inline": False},
+            {"name": "Status Code", "value": str(status_code or "N/A"), "inline": True},
+            {"name": "Error", "value": str(error_message or "Unknown failure"), "inline": True},
+        ]
+    elif alert_type == "RECOVERED":
+        title = f"✅ MONITOR RECOVERED: {monitor_name} IS UP"
+        color = 3066993  # Green
+        fields = [
+            {"name": "URL", "value": url, "inline": False},
+            {"name": "Status Code", "value": str(status_code), "inline": True},
+            {"name": "Status", "value": "Service Restored", "inline": True},
+        ]
 
     payload = {
         "embeds": [
             {
-                "title": f"⚠️ MONITOR ALERT: {monitor_name} IS DOWN",
-                "color": 15158332,  # Red
-                "fields": [
-                    {"name": "URL", "value": url, "inline": False},
-                    {"name": "Status Code", "value": str(status_code or "N/A"), "inline": True},
-                    {"name": "Error", "value": str(error_message or "Unknown failure"), "inline": True},
-                ],
+                "title": title,
+                "color": color,
+                "fields": fields,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             }
         ]
@@ -45,7 +73,7 @@ async def send_discord_alert(client, monitor_name, url, status_code, error_messa
     try:
         response = await client.post(DISCORD_WEBHOOK_URL, json=payload)
         if response.status_code in (200, 204):
-            print(f"[ALERT SENT] Discord notification dispatched for {monitor_name}")
+            print(f"[ALERT SENT] Discord notification dispatched ({alert_type}) for {monitor_name}")
         else:
             print(f"[ALERT ERROR] Discord API returned status code {response.status_code}")
     except Exception as e:
@@ -56,6 +84,9 @@ async def ping_target(client, monitor):
     name = monitor['name']
     url = monitor['url']
     timeout = monitor['timeout_seconds']
+    
+    # Check last known status in Supabase before pinging
+    previous_is_up = get_previous_status(monitor_id)
     
     start_time = time.perf_counter()
     status_code = None
@@ -81,9 +112,13 @@ async def ping_target(client, monitor):
 
     print(f"[{'UP' if is_up else 'DOWN'}] {url} | Status: {status_code} | Latency: {latency_ms}ms")
 
-    # Trigger webhook on failure
+    # State transitions trigger webhooks
     if not is_up:
-        await send_discord_alert(client, name, url, status_code, error_message)
+        # Trigger DOWN alert if site fails
+        await send_discord_alert(client, name, url, status_code, error_message, alert_type="DOWN")
+    elif is_up and previous_is_up is False:
+        # Trigger RECOVERED alert if site was previously down and is now up
+        await send_discord_alert(client, name, url, status_code, None, alert_type="RECOVERED")
 
     return {
         "monitor_id": monitor_id,
